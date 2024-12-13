@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, Condvar};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 struct Process {
@@ -12,14 +12,24 @@ struct Process {
 }
 
 impl Process {
-    pub fn new(command: &str, args: &[&str]) -> Self {
-        let mut process = std::process::Command::new(command)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("Failed to spawn process");
+    pub fn new(command: &str, args: Option<&[&str]>) -> Self {
+        let mut process;
+        if args.is_none() {
+            process = std::process::Command::new(command)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("Failed to spawn process");
+        } else {
+            process = std::process::Command::new(command)
+                .args(args.unwrap())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("Failed to spawn process");
+        }
 
         let stdin = process.stdin.take().expect("Failed to get stdin");
         // let stderr = process.stderr.take().expect("Failed to get stderr");
@@ -51,10 +61,12 @@ impl Process {
                     Err(e) => {
                         eprintln!("Error reading output: {}", e);
                         return;
-                    },
+                    }
                 };
+                let ln_vec:Vec<u8> = strip_ansi_escapes::strip(&ln);
+                let striped_line = String::from_utf8(ln_vec).unwrap();
                 let mut output_buf = output_buf.lock().unwrap();
-                output_buf.push(ln.clone()); 
+                output_buf.push(striped_line);
                 readable.notify_one();
             }
         })
@@ -72,29 +84,82 @@ impl Process {
         output_buf.len()
     }
 
+    pub fn clear(&mut self) {
+        let mut output_buf = self.output_buf.lock().unwrap();
+        output_buf.clear();
+    }
     pub fn drop(&mut self) {
         self.process.kill().expect("Failed to kill process");
     }
 }
 
-fn main() -> std::io::Result<()> {
-    let mut process = Process::new("python3", &["-i"]);
-    let reader = process.start_reader();
-    process.write("print('Hello from Python')")?;
-    process.write("x = 42")?;
-    process.write("print(f'The answer\\n\\n\\n\\n is {x}')")?;
-    process.write("import time; time.sleep(10)")?; // Simulate a delay
-    process.write("print('Goodbye from Python')")?;
-    process.write("exit()")?;
+struct MSFProcess {
+    process: Process,
+    reader: thread::JoinHandle<()>,
+    output: Vec<String>,
+}
 
-    let mut i = 0;
-    while i < 3 {
-        println!("{}", process.read());
-        i += 1;
+impl MSFProcess {
+    pub fn new() -> Self {
+        let mut process = Process::new("msfconsole", None);
+        let reader = process.start_reader();
+        
+        let mut read_line = process.read();
+        while !read_line.contains("msf"){
+            read_line = process.read();
+            println!("{}", read_line);
+        }
+        Self {
+            process,
+            output: Vec::new(),
+            reader,
+        }
     }
 
-    process.drop();
+    pub fn run_command(&mut self, command: &str){
+        self.process.clear();
+        self.process.write(command);
+        let mut read_line = "".to_string();
+        let mut lines_vec = Vec::new();
+        while !read_line.contains("msf6"){
+            read_line = self.process.read();
+            lines_vec.push(read_line.clone());
+            println!("{}\n\n", read_line);
+        };
+        self.output = lines_vec;
 
-    reader.join().unwrap();
+    }
+
+    pub fn clear(&mut self) {
+        self.process.clear();
+        self.output.clear();
+    }
+
+    pub fn drop(&mut self) {
+        self.process.drop();
+    }
+}
+
+fn main() -> std::io::Result<()> {
+    println!("Starting MSF");
+    let mut msf = MSFProcess::new();
+
+    println!("MSF started");
+    msf.clear();
+    
+    println!("Running command: show exploits");
+    msf.run_command("show exploits");
+
+    let lines_vec = msf.output;
+
+    // write to file 
+    let mut file = std::fs::File::create("exploits.json").unwrap();
+    file.write_all(lines_vec.join("\n").as_bytes()).unwrap();
+    file.flush().unwrap();
+
+    println!("Done writing to exploits.json");
+
+    println!("MSF dropped");
+
     Ok(())
 }
