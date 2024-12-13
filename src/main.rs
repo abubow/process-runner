@@ -8,7 +8,7 @@ struct Process {
     stdin: std::process::ChildStdin,
     output_buf: Arc<Mutex<Vec<String>>>,
     readable: Arc<Condvar>,
-    stderr: std::process::ChildStderr,
+    // stderr: std::process::ChildStderr,
 }
 
 impl Process {
@@ -22,14 +22,14 @@ impl Process {
             .expect("Failed to spawn process");
 
         let stdin = process.stdin.take().expect("Failed to get stdin");
-        let stderr = process.stderr.take().expect("Failed to get stderr");
+        // let stderr = process.stderr.take().expect("Failed to get stderr");
 
         Self {
             process,
             stdin,
             output_buf: Arc::new(Mutex::new(Vec::new())),
             readable: Arc::new(Condvar::new()),
-            stderr,
+            // stderr,
         }
     }
 
@@ -61,7 +61,7 @@ impl Process {
     }
 
     pub fn read(&mut self) -> String {
-        let mut output_buf = self.output_buf.lock().unwrap();
+        let mut output_buf = self.readable.wait(self.output_buf.lock().unwrap()).unwrap();
         let res = output_buf.iter().cloned().collect();
         output_buf.clear();
         res
@@ -82,14 +82,13 @@ fn main() -> std::io::Result<()> {
     let reader = process.start_reader();
     process.write("print('Hello from Python')")?;
     process.write("x = 42")?;
-    process.write("print(f'The answer is {x}')")?;
-    process.write("import time; time.sleep(1)")?; // Simulate a delay
+    process.write("print(f'The answer\\n\\n\\n\\n is {x}')")?;
+    process.write("import time; time.sleep(10)")?; // Simulate a delay
     process.write("print('Goodbye from Python')")?;
     process.write("exit()")?;
 
     let mut i = 0;
-    while i < 6 {
-        process.readable.wait(process.output_buf.lock().unwrap()).unwrap();
+    while i < 3 {
         println!("{}", process.read());
         i += 1;
     }
