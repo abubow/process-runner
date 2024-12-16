@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -5,7 +6,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use colored::Colorize;
-use regex::Regex;
+use regex::{Match, Regex};
 use serde::Serialize;
 
 struct Process {
@@ -69,11 +70,13 @@ impl Process {
                         return;
                     }
                 };
-                let ln_vec: Vec<u8> = strip_ansi_escapes::strip(&ln);
-                let striped_line = String::from_utf8(ln_vec).unwrap();
-                println!("{}", ln);
+                let ln: Vec<String> = ln
+                    .split("\n")
+                    .map(|s| String::from_utf8(strip_ansi_escapes::strip(s)).unwrap())
+                    .collect();
+                // println!("{}", ln.join(" \n"));
                 let mut output_buf = output_buf.lock().unwrap();
-                output_buf.push(striped_line);
+                output_buf.push(ln.join(" \n"));
                 readable.notify_one();
             }
         })
@@ -95,7 +98,7 @@ impl Process {
                 };
                 let ln_vec: Vec<u8> = strip_ansi_escapes::strip(&ln);
                 let striped_line = String::from_utf8(ln_vec).unwrap();
-                println!("{}", ln);
+                // println!("{}", ln);
                 let mut output_buf = err_buf.lock().unwrap();
                 output_buf.push(striped_line);
                 err_readable.notify_one();
@@ -105,7 +108,7 @@ impl Process {
 
     pub fn read(&mut self) -> String {
         let mut output_buf = self.readable.wait(self.output_buf.lock().unwrap()).unwrap();
-        let res = output_buf.iter().cloned().collect();
+        let res = output_buf.join("\n");
         output_buf.clear();
         res
     }
@@ -142,8 +145,11 @@ impl Drop for Process {
 #[derive(Serialize, Clone)]
 struct Exploit {
     name: String,
-    options: Vec<String>
+    payload: String,
+    options: Vec<String>,
 }
+#[derive(Serialize, Clone)]
+struct ExploitOptions {}
 struct MSFProcess {
     process: Process,
     reader: thread::JoinHandle<()>,
@@ -183,10 +189,10 @@ impl MSFProcess {
         let mut read_line_err = "".to_string();
         let mut lines_vec = Vec::new();
         while !read_line_err.contains("ping: usage error:") {
-            read_line = self.process.read();
+            read_line = self.process.read() + " ";
             read_line_err = self.process.read_err();
             lines_vec.push(read_line.clone());
-            // println!("{}\n\n", read_line);
+            println!("RUN COMMAND: {}\n\n", read_line);
         }
         self.output = lines_vec;
     }
@@ -210,50 +216,133 @@ impl MSFProcess {
     }
     pub fn get_exploits(&mut self) -> Vec<Exploit> {
         self.run_command("show exploits");
-    
+
         let lines_vec = self.output.clone();
-        let line = lines_vec.join("\n");
-        
+        let line = lines_vec.join(" \n");
+
         let exploit_names = Self::extract_exploit_names(line.as_str());
         let exploits: Vec<Exploit> = exploit_names
             .into_iter()
-            .map(|name| Exploit { name, options:Vec::new()})
+            .map(|name| Exploit {
+                name,
+                options: Vec::new(),
+                payload: "".to_string(),
+            })
             .collect();
         self.clear();
 
         exploits
     }
-    fn extract_options_and_payloads(input: &str){
-        // let mut result = Vec::new();
-    
-        // Regex for capturing the payload and options
-        let payload_re = Regex::new(r"Payload options \((.*?)\):").unwrap();
-        let module_option_re = Regex::new(r"(Module options.*?)Exploit target").unwrap();
-        let target_option_re = Regex::new(r"(\S+)\s+(\S+)\s+(yes|no)\s+(.*)").unwrap(); // Pattern for capturing options
-    
-        // Extract payloads value from string
-        let payload_match = payload_re.find(input).unwrap();
-        let payload_str = payload_match.as_str();
-        let payload_idx = payload_match.start();
 
-        // create substring till first instance of "Payload options"
-        let module_option_sub = &input[..payload_idx];
-        let module_options = module_option_re.captures_iter(&module_option_sub).map(|c| c.get(0).unwrap().as_str());
-        for i in module_options {
-            println!("{}\n\n\n", i);
+    fn parse_option(input: Vec<&str>) -> Vec<Vec<String>> {
+        println!("Parsing: {:#?}", input);
+        let mut res = Vec::new();
+        let mut input = VecDeque::from(input);
+        loop {
+            println!("Len: {}", input.len());
+            let last;
+            if input.len() == 3 {
+                last = "|-line-|";
+            } else {
+                last = &input[3];
+            }
+            let mut options = Vec::new();
+            println!("first: {}", input[0]);
+            if last.to_string() == "|-line-|" {
+                options.push(VecDeque::pop_front(&mut input).unwrap().to_string());
+                options.push("".to_string());
+                options.push(VecDeque::pop_front(&mut input).unwrap().to_string());
+                options.push(VecDeque::pop_front(&mut input).unwrap().to_string());
+                if input.len() != 0 && input[0].to_string() == "|-line-|" {
+                    VecDeque::pop_front(&mut input).unwrap();
+                }
+            } else {
+                for i in 0..4 {
+                    options.push(VecDeque::pop_front(&mut input).unwrap().to_string());
+                }
+                if input.len() != 0 && input[0].to_string() == "|-line-|" {
+                    VecDeque::pop_front(&mut input).unwrap();
+                }
+            }
+            res.push(options);
+            if input.len() == 0 {
+                break;
+            }
         }
+        res
+    }
+    fn extract_options_and_payloads(input: &str) {
+        println!("Extracting from: {:#?}", input);
+        let payload_str;
+        let module_option_sub;
+        let exploit_targets_sub;
+        let payload_search_str = "Payload options (";
+        let exploit_search_str = "Exploit target:";
+        let exploit_search_end_str = "\n\n\n\n";
+        let exploit_end_idx = input.find(exploit_search_end_str).unwrap();
+        let payload_idx_res = input.find(payload_search_str);
+
+        if payload_idx_res.is_none() {
+            let exp_idx = input.find(exploit_search_str).unwrap();
+
+            payload_str = "";
+            module_option_sub = &input[..exp_idx];
+            exploit_targets_sub = &input[exp_idx..exploit_end_idx];
+        } else {
+            let payload_idx = payload_idx_res.unwrap();
+            let payload_end_idx = input[payload_idx..].find("):").unwrap();
+            let exp_idx = input[payload_idx..].find(exploit_search_str).unwrap();
+
+            println!("Start: {} \nEnd: {}", payload_idx, payload_end_idx);
+            payload_str =
+                &input[payload_idx + payload_search_str.len()..payload_idx + payload_end_idx];
+            module_option_sub = &input[..payload_idx];
+            exploit_targets_sub =
+                &input[payload_idx + exp_idx + exploit_search_str.len()..exploit_end_idx];
+        }
+
+        let sep = " -----------\n";
+        let module_options_unparsed =
+            &module_option_sub[module_option_sub.find(sep).unwrap() + sep.len()..];
+        let sep = " ----\n";
+        let exploit_target_unparsed =
+            &exploit_targets_sub[exploit_targets_sub.find(sep).unwrap() + sep.len()..];
+
+        let mod_lines: Vec<&str> = module_options_unparsed
+            .split("\n")
+            .filter(|w| w.to_string() != "")
+            .collect();
+        let newline = mod_lines.join("  |-line-|  ");
+        let module_options_vec: Vec<&str> = newline
+            .split("  ")
+            .map(|w| w.trim())
+            .filter(|w| w.to_string() != "")
+            .collect();
+
+        let module_options = MSFProcess::parse_option(module_options_vec);
+
+        let exploit_target: Vec<&str> = exploit_target_unparsed
+            .split("  ")
+            .map(|w| w.trim())
+            .filter(|w| w.to_string() != "")
+            .collect();
+        println!("--------------------------------");
+        println!("Module sections: {:#?}\n\n", module_options);
+        println!("Payload: {}\n\n", payload_str);
+        println!("Exploits section: {:#?}", exploit_target);
+        println!("--------------------------------");
     }
     pub fn add_options(&mut self, exploit: &mut Exploit) {
-
         let use_command = format!("use {}", exploit.name);
         self.run_command(&use_command);
         self.clear();
 
         let show_options = "show options";
-        self.run_command(&show_options);    
+        self.run_command(&show_options);
         let output = self.output.clone();
-        let text = output.join("\n");
-        let options = MSFProcess::extract_exploit_names(text.as_str());
+        let text = output.join(" ");
+        println!("vec: {:#?}\ntext:{}", output, text);
+        let options = MSFProcess::extract_options_and_payloads(text.as_str());
 
         let back = "back";
         self.run_command(&back);
@@ -266,19 +355,21 @@ impl Drop for MSFProcess {
     }
 }
 
-
 fn main() -> std::io::Result<()> {
-    println!("Starting MSF");
-    let mut msf = MSFProcess::new();
+    let mut exploits;
+    {
+        println!("Starting MSF");
+        let mut msf = MSFProcess::new();
 
-    println!("MSF started");
-    msf.clear();
+        println!("MSF started");
+        msf.clear();
 
-
-    let mut exploits = msf.get_exploits();
-    for i in 0..3{
-        let mut exploit = &mut exploits[i];
-        msf.add_options(&mut exploit);
+        exploits = msf.get_exploits();
+        for i in 0..13 {
+            let mut exploit = &mut exploits[i];
+            println!("Adding details to: {}", exploit.name);
+            msf.add_options(&mut exploit);
+        }
     }
     // write to file
     let mut file = std::fs::File::create("exploits.json").unwrap();
