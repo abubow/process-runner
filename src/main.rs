@@ -146,7 +146,8 @@ impl Drop for Process {
 struct Exploit {
     name: String,
     payload: String,
-    options: Vec<String>,
+    options: Vec<Vec<String>>,
+    target: Vec<String>,
 }
 #[derive(Serialize, Clone)]
 struct ExploitOptions {}
@@ -226,6 +227,7 @@ impl MSFProcess {
             .map(|name| Exploit {
                 name,
                 options: Vec::new(),
+                target: Vec::new(),
                 payload: "".to_string(),
             })
             .collect();
@@ -271,7 +273,7 @@ impl MSFProcess {
         }
         res
     }
-    fn extract_options_and_payloads(input: &str) {
+    fn extract_options_and_payloads(input: &str) -> (String, Vec<Vec<String>>, Vec<String>) {
         println!("Extracting from: {:#?}", input);
         let payload_str;
         let module_option_sub;
@@ -321,16 +323,18 @@ impl MSFProcess {
 
         let module_options = MSFProcess::parse_option(module_options_vec);
 
-        let exploit_target: Vec<&str> = exploit_target_unparsed
+        let exploit_target: Vec<String> = exploit_target_unparsed
             .split("  ")
-            .map(|w| w.trim())
-            .filter(|w| w.to_string() != "")
+            .map(|w| w.trim().to_string())
+            .filter(|w| w != "")
             .collect();
         println!("--------------------------------");
         println!("Module sections: {:#?}\n\n", module_options);
         println!("Payload: {}\n\n", payload_str);
         println!("Exploits section: {:#?}", exploit_target);
         println!("--------------------------------");
+
+        (payload_str.to_string(), module_options, exploit_target)
     }
     pub fn add_options(&mut self, exploit: &mut Exploit) {
         let use_command = format!("use {}", exploit.name);
@@ -343,6 +347,9 @@ impl MSFProcess {
         let text = output.join(" ");
         println!("vec: {:#?}\ntext:{}", output, text);
         let options = MSFProcess::extract_options_and_payloads(text.as_str());
+        exploit.payload = options.0;
+        exploit.options = options.1;
+        exploit.target = options.2;
 
         let back = "back";
         self.run_command(&back);
