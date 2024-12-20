@@ -5,7 +5,8 @@ edition = "2021"
 
 [dependencies]
 strip-ansi-escapes = "0.2.0"
-colored = "1.0.0"
-regex = "=0.2.11"
+colored = "2.2.0"
+regex = "1.11.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.0"
+indicatif = "0.17.9"

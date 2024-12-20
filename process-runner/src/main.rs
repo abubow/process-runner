@@ -1,3 +1,4 @@
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::process::Stdio;
@@ -65,7 +66,7 @@ impl Process {
                 let ln = match line {
                     Ok(output) => output,
                     Err(e) => {
-                        eprintln!("Error reading output: {}", e);
+                        // eprintln!("Error reading output: {}", e);
                         return;
                     }
                 };
@@ -73,9 +74,9 @@ impl Process {
                     .split("\n")
                     .map(|s| String::from_utf8(strip_ansi_escapes::strip(s)).unwrap())
                     .collect();
-                // println!("{}", ln.join(" \n"));
+                // eprintln!("{}", ln.join(" \n"));
                 let mut output_buf = output_buf.lock().unwrap();
-                output_buf.push(ln.join(" \n"));
+                output_buf.push(ln.join("\n"));
                 readable.notify_one();
             }
         })
@@ -91,13 +92,13 @@ impl Process {
                 let ln = match line {
                     Ok(output) => output,
                     Err(e) => {
-                        eprintln!("Error reading output: {}", e);
+                        // eprintln!("Error reading output: {}", e);
                         return;
                     }
                 };
                 let ln_vec: Vec<u8> = strip_ansi_escapes::strip(&ln);
                 let striped_line = String::from_utf8(ln_vec).unwrap();
-                // println!("{}", ln);
+                // eprintln!("{}", ln);
                 let mut output_buf = err_buf.lock().unwrap();
                 output_buf.push(striped_line);
                 err_readable.notify_one();
@@ -135,9 +136,9 @@ impl Process {
 
 impl Drop for Process {
     fn drop(&mut self) {
-        println!("Sending Kill signal to process");
+        // eprintln!("Sending Kill signal to process");
         self.process.kill().expect("Failed to kill process");
-        println!("Process dropped");
+        // eprintln!("Process dropped");
     }
 }
 
@@ -168,10 +169,10 @@ impl MSFProcess {
         let mut read_line = process.read();
         while !read_line.contains("Metasploit Documentation:") {
             read_line = process.read();
-            // println!("{}", read_line);
+            // eprintln!("{}", read_line);
         }
         thread::sleep(std::time::Duration::from_secs(1));
-        println!("MSF started\n{}", read_line);
+        // eprintln!("MSF started\n{}", read_line);
         Self {
             process,
             reader,
@@ -183,7 +184,7 @@ impl MSFProcess {
     }
 
     pub fn run_command(&mut self, command: &str) {
-        println!("Running command: {}", command);
+        // eprintln!("Running command: {}", command);
         self.process.clear();
         self.process.write(command);
         self.process.write("ping");
@@ -194,7 +195,7 @@ impl MSFProcess {
             read_line = self.process.read() + " ";
             read_line_err = self.process.read_err();
             lines_vec.push(read_line.clone());
-            // println!("RUN COMMAND: {}\n\n", read_line);
+            // eprintln!("RUN COMMAND: {}\n\n", read_line);
         }
         self.output = lines_vec;
     }
@@ -225,7 +226,7 @@ impl MSFProcess {
         self.run_command("show exploits");
 
         let lines_vec = self.output.clone();
-        let line = lines_vec.join(" \n");
+        let line = lines_vec.join("\n");
 
         let exploit_names = Self::extract_exploit_names(line.as_str());
         let exploits: Vec<Exploit> = exploit_names
@@ -242,20 +243,27 @@ impl MSFProcess {
         exploits
     }
 
-    fn parse_option(input: Vec<String>) -> Vec<Vec<String>> {
-        // println!("Parsing: {:#?}", input);
+    fn parse_option(input: Vec<String>) -> Option<Vec<Vec<String>>> {
+        // eprintln!("Parsing: {:#?}", input);
         let mut res = Vec::new();
         let mut input = VecDeque::from(input);
         loop {
-            // println!("Len: {}", input.len());
+            // eprintln!("Len: {}", input.len());
             let last;
             if input.len() == 3 {
                 last = "|-line-|";
+            } else if input.len() < 4 {
+                // eprintln!(
+                //     "{} {:#?}",
+                //     "Error in parse_options: Out of bounds Access in".red(),
+                //     input
+                // );
+                return None;
             } else {
                 last = &input[3];
             }
             let mut options = Vec::new();
-            // println!("first: {}", input[0]);
+            // eprintln!("first: {}", input[0]);
             if last.to_string() == "|-line-|" {
                 options.push(VecDeque::pop_front(&mut input).unwrap());
                 options.push("".to_string());
@@ -277,31 +285,55 @@ impl MSFProcess {
                 break;
             }
         }
-        res
+        Some(res)
     }
 
     fn extract_options_and_payloads(
         input: &str,
     ) -> Option<(String, Vec<Vec<String>>, Vec<String>)> {
-        println!("Extracting from: {:#?}", input);
+        // eprintln!("Extracting from: {:#?}", input);
         let payload_str;
         let module_option_sub;
         let exploit_targets_sub;
         let payload_search_str = "Payload options (";
         let exploit_search_str = "Exploit target:";
         let exploit_search_end_str = "\n\n\n\n";
-        let exploit_end_idx = input.find(exploit_search_end_str).unwrap();
+        let exploit_end_idx = input.find(exploit_search_end_str);
+        if exploit_end_idx.is_none() {
+            // eprintln!("{}:No exploit found.\nInput:{:#?}", "Error".red(), input);
+            return None;
+        }
+        let exploit_end_idx = exploit_end_idx.unwrap();
         let payload_idx_res = input.find(payload_search_str);
 
         if payload_idx_res.is_none() {
-            let exp_idx = input.find(exploit_search_str).unwrap();
+            let exp_idx = input.find(exploit_search_str);
+            if exp_idx.is_none() {
+                // eprintln!("{}:No exploit found.\nInput:{:#?}", "Error".red(), input);
+                return None;
+            }
+            let exp_idx = exp_idx.unwrap();
 
             payload_str = "";
-            if input.len() >= exp_idx {
+            if input.len() <= exp_idx {
+                // eprintln!(
+                //     "{}:Out of bounds. Looking for module options substring. \nInput len:{} idx:{}\n {:#?}",
+                //     "Error".red(),
+                //     input.len(),
+                //     exp_idx,
+                //     input
+                // );
                 return None;
             }
             module_option_sub = &input[..exp_idx];
             if input.len() <= exploit_end_idx {
+                // eprintln!(
+                //     "{}:Out of bounds. Looking for exploit targets substring. \nInput len:{} idx:{}\n {:#?}",
+                //     "Error".red(),
+                //     input.len(),
+                //     exploit_end_idx,
+                //     input
+                // );
                 return None;
             }
             exploit_targets_sub = &input[exp_idx..exploit_end_idx];
@@ -309,22 +341,45 @@ impl MSFProcess {
             let payload_idx = payload_idx_res.unwrap();
             let payload_end_idx = input[payload_idx..].find("):");
             if payload_end_idx.is_none() {
+                // eprintln!("{}:No payload found.\nInput:{:#?}", "Error".red(), input);
                 return None;
             }
             let payload_end_idx = payload_end_idx.unwrap();
             let exp_idx = input[payload_idx..].find(exploit_search_str);
             if exp_idx.is_none() {
+                // eprintln!("{}:No exploit found.\nInput:{:#?}", "Error".red(), input);
                 return None;
             }
             let exp_idx = exp_idx.unwrap();
 
             if payload_idx >= input.len() {
+                // eprintln!(
+                //     "{}:Out of bounds. Looking for payload substring. \nInput len:{} idx:{}\n {:#?}",
+                //     "Error".red(),
+                //     input.len(),
+                //     payload_idx,
+                //     input
+                // );
                 return None;
             }
             if payload_idx + payload_end_idx >= input.len() {
+                // eprintln!(
+                //     "{}:Out of bounds. Looking for payload end substring. \nInput len:{} idx:{}\n {:#?}",
+                //     "Error".red(),
+                //     input.len(),
+                //     payload_idx + payload_end_idx,
+                //     input
+                // );
                 return None;
             }
             if exploit_end_idx >= input.len() {
+                // eprintln!(
+                //     "{}:Out of bounds. Looking for exploit end substring. \nInput len:{} idx:{}\n {:#?}",
+                //     "Error".red(),
+                //     input.len(),
+                //     exploit_end_idx,
+                //     input
+                // );
                 return None;
             }
 
@@ -336,15 +391,29 @@ impl MSFProcess {
         }
 
         let sep = " -----------\n";
-        let module_options_start = module_option_sub.find(sep);
+        let mut module_options_start = module_option_sub.find(sep);
         if module_options_start.is_none() {
-            return None;
+            let sep = " ----------- \n";
+            module_options_start = module_option_sub.find(sep);
+            if module_options_start.is_none() {
+                // eprintln!(
+                //     "{}:No module options found.\nmodule_option_sub:{:#?}",
+                //     "Error".red(),
+                //     module_option_sub
+                // );
+                return None;
+            }
         }
         let module_options_start = module_options_start.unwrap();
         let module_options_unparsed = &module_option_sub[module_options_start + sep.len()..];
         let sep = " ----\n";
         let exploits_start = exploit_targets_sub.find(sep);
         if exploits_start.is_none() {
+            // eprintln!(
+            //     "{}:No exploit targets found.\nmodule_option_sub:{:#?}",
+            //     "Error".red(),
+            //     module_option_sub
+            // );
             return None;
         }
         let exploits_start = exploits_start.unwrap();
@@ -356,12 +425,8 @@ impl MSFProcess {
             .filter(|w| w.to_string() != "")
             .collect();
         let newline = mod_lines.join("  |-line-|  ");
-        let mut module_options_vec: Vec<String> = newline
-            .split("  ")
-            .map(|w| {
-                w.trim().to_string()
-            })
-            .collect();
+        let mut module_options_vec: Vec<String> =
+            newline.split("  ").map(|w| w.trim().to_string()).collect();
 
         // fixing for multi line sections
         let mut line_section_count = 0;
@@ -437,6 +502,10 @@ impl MSFProcess {
             .filter(|w| w != "")
             .collect();
         let module_options = MSFProcess::parse_option(module_options_vec);
+        if module_options.is_none() {
+            return None;
+        }
+        let module_options = module_options.unwrap();
 
         let exploit_target: Vec<String> = exploit_target_unparsed
             .split("  ")
@@ -463,7 +532,7 @@ impl MSFProcess {
             self.run_command(&show_options);
             let output = self.output.clone();
             let text = output.join("\n");
-            // println!("vec: {:#?}\ntext:{}", output, text);
+            // eprintln!("vec: {:#?}\ntext:{}", output, text);
             let options = MSFProcess::extract_options_and_payloads(text.as_str());
             if options.is_none() {
                 try_i += 1;
@@ -488,23 +557,23 @@ impl MSFProcess {
 }
 impl Drop for MSFProcess {
     fn drop(&mut self) {
-        println!("Dropping MSFProcess");
+        // eprintln!("Dropping MSFProcess");
     }
 }
 
 fn main() -> std::io::Result<()> {
     let exploits;
     {
-        println!("Starting MSF");
+        eprintln!("Starting MSF");
         let mut msf = MSFProcess::new();
 
-        println!("MSF started");
+        eprintln!("MSF started");
         msf.clear();
 
         exploits = msf.get_exploits();
         // for i in 0..exploits.len() {
         //     let mut exploit = &mut exploits[i];
-        //     println!("{}: Adding details to: {}", i, exploit.name);
+        //     eprintln!("{}: Adding details to: {}", i, exploit.name);
         //     msf.add_options(&mut exploit);
         // }
     }
@@ -514,7 +583,7 @@ fn main() -> std::io::Result<()> {
     // each process of msf
     let args = env::args().collect::<Vec<String>>();
     let mut num_threads_per_process = 1;
-    let mut num_process = 20;
+    let mut num_process = 8;
     if args.len() > 2 {
         num_threads_per_process = args[1].parse().unwrap();
         num_process = args[2].parse().unwrap();
@@ -526,68 +595,114 @@ fn main() -> std::io::Result<()> {
 
     let mut process_threads = Vec::new();
     let mut output_exploits = Arc::new(Mutex::new(Vec::new()));
+    let running_process = Arc::new(Mutex::new(Vec::from([9999usize])));
+
+    let multi_progress = Arc::new(MultiProgress::new());
+    let process_bar = Arc::new(multi_progress.add(ProgressBar::new(num_process as u64)));
+
+    process_bar.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{wide_bar:.cyan/blue}] {pos}/{len} Processes")
+            .unwrap(),
+    );
+
     for proc in 0..num_process {
         let process_start = proc * exploits_per_process;
         let process_end = (proc + 1) * exploits_per_process;
-        println!("Process {} - {} to {}", proc, process_start, process_end);
+        eprintln!("Process {} - {} to {}", proc, process_start, process_end);
         let output_exploits_outer = Arc::clone(&output_exploits);
-        let thread = thread::spawn(move || {
-            let mut msf = Arc::new(Mutex::new(MSFProcess::new()));
+        let running_proc = Arc::clone(&running_process);
+
+        let thread_bar = multi_progress.add(ProgressBar::new(exploits_per_thread as u64));
+        thread_bar.set_style(
+            ProgressStyle::default_bar()
+                .template("Process Thread {pos}/{len}: {spinner:.green} [{wide_bar:.magenta/blue}]")
+                .unwrap(),
+        );
+        let process_bar = Arc::clone(&process_bar);
+        let process_thread = thread::spawn(move || {
+            let msf = Arc::new(Mutex::new(MSFProcess::new()));
+            {
+                let mut lck = running_proc.lock().unwrap();
+                lck.insert(0, proc);
+            }
             let mut threads = Vec::new();
             // spawn threads
             for thr_idx in 0..num_threads_per_process {
                 let msf_clone = Arc::clone(&msf);
                 let output_exploits_clone = Arc::clone(&output_exploits_outer);
+                let thread_bar_clone = thread_bar.clone();
+
                 let thread = thread::spawn(move || {
                     let thread_start = process_start + thr_idx * exploits_per_thread;
                     let mut thread_end = process_start + (thr_idx + 1) * exploits_per_thread;
                     if (thr_idx == num_threads_per_process - 1) && ((proc + 1) == num_process) {
                         thread_end = exp_len;
                     }
-                    println!("Thread {} - {} to {}", thr_idx, thread_start, thread_end);
+                    eprintln!("Thread {} - {} to {}", thr_idx, thread_start, thread_end);
                     let mut msf = msf_clone.lock().unwrap();
                     let mut exploits = msf.get_exploits();
                     for i in thread_start..thread_end {
                         let mut exploit = &mut exploits[i];
                         let res = msf.add_options(&mut exploit, Some(5));
                         if res.is_err() {
-                            eprintln!(
-                                "{} adding options to exploit: {}",
-                                "Error:".red(),
-                                exploit.name
-                            );
+                            // eprintln!(
+                            //     "{} {} proc {}: adding options to exploit: {}",
+                            //     "Error thread".red(),
+                            //     thr_idx,
+                            //     proc,
+                            //     exploit.name
+                            // );
                             continue;
                         }
+                        thread_bar_clone.inc(1);
                     }
                     let mut output_exploits = output_exploits_clone.lock().unwrap();
                     output_exploits.append(&mut exploits[thread_start..thread_end].to_vec());
                 });
                 threads.push(thread);
             }
+            // eprintln!("{} {} waiting for threads", "Process".green(), proc);
             for thread in threads {
-                thread.join().unwrap();
+                thread.join();
+            }
+            // eprintln!("{} {} done waiting for threads", "Process".green(), proc);
+            thread_bar.finish_with_message(format!("Process {} Complete", proc));
+            process_bar.inc(1);
+            {
+                let mut lck = running_proc.lock().unwrap();
+                // remove the current proc from list
+                let index = lck.iter().position(|x| *x == proc).unwrap();
+                lck.remove(index);
+                // eprintln!("Remaining running process {:#?}", lck);
             }
         });
-        process_threads.push(thread);
+        process_threads.push(process_thread);
     }
 
+    // join threads
+    let process_count = process_threads.len();
+    // eprintln!("Started and now waiting for {} processes", process_count);
     for process in process_threads {
         process.join();
+        // eprintln!("Process joined");
     }
+    eprintln!("Done waiting for {} processes", process_count);
+    process_bar.finish_with_message("All processes completed!");
 
-    println!("Done adding options");
+    eprintln!("Done adding options");
     let mut exploits = output_exploits.lock().unwrap().clone();
-    println!("Exploits: {}", exploits.len());
+    eprintln!("Exploits: {}", exploits.len());
 
-    println!("Writing to exploits.json");
+    eprintln!("Writing to exploits.json");
     // write to file
     let file = std::fs::File::create("exploits.json").unwrap();
     serde_json::to_writer_pretty(file, &exploits).unwrap();
-    println!("Done writing to exploits.json");
+    eprintln!("Done writing to exploits.json");
 
-    println!("MSF dropped");
+    eprintln!("MSF dropped");
     // timeout for 10 seconds
-    thread::sleep(std::time::Duration::from_secs(10));
+    // thread::sleep(std::time::Duration::from_secs(10));
 
     Ok(())
 }
