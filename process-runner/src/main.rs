@@ -1,14 +1,17 @@
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif_log_bridge::LogWrapper;
+use log::{debug, error, info, warn, Level};
 use std::collections::VecDeque;
+use std::f32::consts::E;
 use std::io::{BufRead, BufReader, Write};
 use std::process::Stdio;
 use std::sync::{Arc, Condvar, Mutex};
 use std::{env, thread};
 
 use colored::Colorize;
+use env_logger;
 use regex::Regex;
 use serde::Serialize;
-
 struct Process {
     process: std::process::Child,
     stdin: std::process::ChildStdin,
@@ -63,10 +66,11 @@ impl Process {
         thread::spawn(move || {
             let reader = BufReader::new(out);
             for line in reader.lines() {
+                // thread::sleep(std::time::Duration::from_millis(1));
                 let ln = match line {
                     Ok(output) => output,
                     Err(e) => {
-                        // eprintln!("Error reading output: {}", e);
+                        error!("Error reading output: {}", e);
                         return;
                     }
                 };
@@ -89,10 +93,11 @@ impl Process {
         thread::spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
+                // thread::sleep(std::time::Duration::from_millis(1));
                 let ln = match line {
                     Ok(output) => output,
                     Err(e) => {
-                        // eprintln!("Error reading output: {}", e);
+                        error!("Error reading output: {}", e);
                         return;
                     }
                 };
@@ -149,8 +154,6 @@ struct Exploit {
     options: Vec<Vec<String>>,
     target: Vec<String>,
 }
-#[derive(Serialize, Clone)]
-struct ExploitOptions {}
 struct MSFProcess {
     process: Process,
     reader: thread::JoinHandle<()>,
@@ -167,12 +170,15 @@ impl MSFProcess {
         let err_reader = process.start_error_reader();
 
         let mut read_line = process.read();
-        while !read_line.contains("Metasploit Documentation:") {
-            read_line = process.read();
-            // eprintln!("{}", read_line);
-        }
+        let mut read_line_err = process.read_err();
         thread::sleep(std::time::Duration::from_secs(1));
-        // eprintln!("MSF started\n{}", read_line);
+        let _ = process.write("ping");
+        while !read_line_err.contains("ping: usage error:") {
+            read_line = process.read();
+            read_line_err = process.read_err();
+            debug!("{}", read_line);
+        }
+        debug!("MSF started\n{}", read_line);
         Self {
             process,
             reader,
@@ -184,10 +190,11 @@ impl MSFProcess {
     }
 
     pub fn run_command(&mut self, command: &str) {
-        // eprintln!("Running command: {}", command);
+        // info!("Running command: {}", command);
         self.process.clear();
-        self.process.write(command);
-        self.process.write("ping");
+        let _ = self.process.write(command);
+        thread::sleep(std::time::Duration::from_millis(1));
+        let _ = self.process.write("ping");
         let mut read_line;
         let mut read_line_err = "".to_string();
         let mut lines_vec = Vec::new();
@@ -290,7 +297,7 @@ impl MSFProcess {
 
     fn extract_options_and_payloads(
         input: &str,
-    ) -> Option<(String, Vec<Vec<String>>, Vec<String>)> {
+    ) -> Result<(String, Vec<Vec<String>>, Vec<String>), String> {
         // eprintln!("Extracting from: {:#?}", input);
         let payload_str;
         let module_option_sub;
@@ -300,8 +307,13 @@ impl MSFProcess {
         let exploit_search_end_str = "\n\n\n\n";
         let exploit_end_idx = input.find(exploit_search_end_str);
         if exploit_end_idx.is_none() {
-            // eprintln!("{}:No exploit found.\nInput:{:#?}", "Error".red(), input);
-            return None;
+            let msg = format!(
+                "{}:No exploit target endfound.\nInput:{:#?}",
+                "Error".red(),
+                input
+            );
+            warn!("{}", msg);
+            return Err(msg);
         }
         let exploit_end_idx = exploit_end_idx.unwrap();
         let payload_idx_res = input.find(payload_search_str);
@@ -309,78 +321,56 @@ impl MSFProcess {
         if payload_idx_res.is_none() {
             let exp_idx = input.find(exploit_search_str);
             if exp_idx.is_none() {
-                // eprintln!("{}:No exploit found.\nInput:{:#?}", "Error".red(), input);
-                return None;
+                let msg = format!("{}:No exploit found.\nInput:{:#?}", "Error".red(), input);
+                warn!("{}", msg);
+                return Err(msg);
             }
             let exp_idx = exp_idx.unwrap();
 
             payload_str = "";
             if input.len() <= exp_idx {
-                // eprintln!(
-                //     "{}:Out of bounds. Looking for module options substring. \nInput len:{} idx:{}\n {:#?}",
-                //     "Error".red(),
-                //     input.len(),
-                //     exp_idx,
-                //     input
-                // );
-                return None;
+                let msg = format!("{}:Out of bounds. Looking for module options substring. \nInput len:{} idx:{}\n {:#?}", "Error".red(), input.len(), exp_idx, input);
+                warn!("{}", msg);
+                return Err(msg);
             }
             module_option_sub = &input[..exp_idx];
             if input.len() <= exploit_end_idx {
-                // eprintln!(
-                //     "{}:Out of bounds. Looking for exploit targets substring. \nInput len:{} idx:{}\n {:#?}",
-                //     "Error".red(),
-                //     input.len(),
-                //     exploit_end_idx,
-                //     input
-                // );
-                return None;
+                let msg = format!("{}:Out of bounds. Looking for exploit targets substring. \nInput len:{} idx:{}\n {:#?}", "Error".red(), input.len(), exploit_end_idx, input);
+                warn!("{}", msg);
+                return Err(msg);
             }
             exploit_targets_sub = &input[exp_idx..exploit_end_idx];
         } else {
             let payload_idx = payload_idx_res.unwrap();
             let payload_end_idx = input[payload_idx..].find("):");
             if payload_end_idx.is_none() {
-                // eprintln!("{}:No payload found.\nInput:{:#?}", "Error".red(), input);
-                return None;
+                let msg = format!("{}:No payload found.\nInput:{:#?}", "Error".red(), input);
+                warn!("{}", msg);
+                return Err(msg);
             }
             let payload_end_idx = payload_end_idx.unwrap();
             let exp_idx = input[payload_idx..].find(exploit_search_str);
             if exp_idx.is_none() {
-                // eprintln!("{}:No exploit found.\nInput:{:#?}", "Error".red(), input);
-                return None;
+                let msg = format!("{}:No exploit found.\nInput:{:#?}", "Error".red(), input);
+                warn!("{}", msg);
+                return Err(msg);
             }
             let exp_idx = exp_idx.unwrap();
 
             if payload_idx >= input.len() {
-                // eprintln!(
-                //     "{}:Out of bounds. Looking for payload substring. \nInput len:{} idx:{}\n {:#?}",
-                //     "Error".red(),
-                //     input.len(),
-                //     payload_idx,
-                //     input
-                // );
-                return None;
+                let msg = format!("{}:Out of bounds. Looking for payload substring. \nInput len:{} idx:{}\n {:#?}", "Error".red(), input.len(), payload_idx, input);
+                warn!("{}", msg);
+                return Err(msg);
             }
             if payload_idx + payload_end_idx >= input.len() {
-                // eprintln!(
-                //     "{}:Out of bounds. Looking for payload end substring. \nInput len:{} idx:{}\n {:#?}",
-                //     "Error".red(),
-                //     input.len(),
-                //     payload_idx + payload_end_idx,
-                //     input
-                // );
-                return None;
+                let msg =  format!("{}:Out of bounds. Looking for payload end substring. \nInput len:{} idx:{}\n {:#?}", "Error".red(), input.len(), payload_idx + payload_end_idx, input);
+                warn!("{}", msg);
+                return Err(msg);
             }
             if exploit_end_idx >= input.len() {
-                // eprintln!(
-                //     "{}:Out of bounds. Looking for exploit end substring. \nInput len:{} idx:{}\n {:#?}",
-                //     "Error".red(),
-                //     input.len(),
-                //     exploit_end_idx,
-                //     input
-                // );
-                return None;
+                let msg = format!("{}:Out of bounds. Looking for exploit end substring. \nInput len:{} idx:{}\n {:#?}", "Error".red(), input.len(), exploit_end_idx, input);
+                warn!("{}", msg);
+                return Err(msg);
             }
 
             payload_str =
@@ -396,25 +386,31 @@ impl MSFProcess {
             let sep = " ----------- \n";
             module_options_start = module_option_sub.find(sep);
             if module_options_start.is_none() {
-                // eprintln!(
-                //     "{}:No module options found.\nmodule_option_sub:{:#?}",
-                //     "Error".red(),
-                //     module_option_sub
-                // );
-                return None;
+                let msg = format!(
+                    "{}:No module options found.\nmodule_option_sub:{:#?}",
+                    "Error".red(),
+                    module_option_sub
+                );
+                warn!("{}", msg);
+                return Err(msg);
             }
         }
         let module_options_start = module_options_start.unwrap();
         let module_options_unparsed = &module_option_sub[module_options_start + sep.len()..];
         let sep = " ----\n";
-        let exploits_start = exploit_targets_sub.find(sep);
+        let mut exploits_start = exploit_targets_sub.find(sep);
         if exploits_start.is_none() {
-            // eprintln!(
-            //     "{}:No exploit targets found.\nmodule_option_sub:{:#?}",
-            //     "Error".red(),
-            //     module_option_sub
-            // );
-            return None;
+            let sep = " ---- \n";
+            exploits_start = exploit_targets_sub.find(sep);
+            if exploits_start.is_none() {
+                let msg = format!(
+                    "{}:No exploit targets found.\nmodule_option_sub:{:#?}",
+                    "Error".red(),
+                    module_option_sub
+                );
+                warn!("{}", msg);
+                return Err(msg);
+            }
         }
         let exploits_start = exploits_start.unwrap();
         let exploit_target_unparsed = &exploit_targets_sub[exploits_start + sep.len()..];
@@ -477,9 +473,10 @@ impl MSFProcess {
                     }
                     sections_to_remove.push((last_line_index, i));
                     last_line_index = i;
+                } else {
+                    previous_section_indexes = section_indexes;
                 }
                 line_section_count = 0;
-                previous_section_indexes = section_indexes;
                 section_indexes = [0, 0, 0, 0];
             } else if module_options_vec[i] != "" {
                 section_indexes[line_section_count] = i;
@@ -503,7 +500,11 @@ impl MSFProcess {
             .collect();
         let module_options = MSFProcess::parse_option(module_options_vec);
         if module_options.is_none() {
-            return None;
+            return Err(format!(
+                "{}:No module options found.\nmodule_option_sub:{:#?}",
+                "Error".red(),
+                module_option_sub
+            ));
         }
         let module_options = module_options.unwrap();
 
@@ -513,10 +514,14 @@ impl MSFProcess {
             .filter(|w| w != "")
             .collect();
 
-        Some((payload_str.to_string(), module_options, exploit_target))
+        Ok((payload_str.to_string(), module_options, exploit_target))
     }
 
-    pub fn add_options(&mut self, exploit: &mut Exploit, retries: Option<usize>) -> Result<(), ()> {
+    pub fn add_options(
+        &mut self,
+        exploit: &mut Exploit,
+        retries: Option<usize>,
+    ) -> Result<(), String> {
         let use_command = format!("use {}", exploit.name);
         self.run_command(&use_command);
         self.clear();
@@ -534,10 +539,10 @@ impl MSFProcess {
             let text = output.join("\n");
             // eprintln!("vec: {:#?}\ntext:{}", output, text);
             let options = MSFProcess::extract_options_and_payloads(text.as_str());
-            if options.is_none() {
+            if options.is_err() {
                 try_i += 1;
                 if try_i >= retries {
-                    return Err(());
+                    return Err(options.unwrap_err());
                 }
                 continue;
             }
@@ -558,26 +563,12 @@ impl MSFProcess {
 impl Drop for MSFProcess {
     fn drop(&mut self) {
         // eprintln!("Dropping MSFProcess");
+        info!("Dropping MSFProcess");
+        info!("Dropped MSFProcess");
     }
 }
 
 fn main() -> std::io::Result<()> {
-    let exploits;
-    {
-        eprintln!("Starting MSF");
-        let mut msf = MSFProcess::new();
-
-        eprintln!("MSF started");
-        msf.clear();
-
-        exploits = msf.get_exploits();
-        // for i in 0..exploits.len() {
-        //     let mut exploit = &mut exploits[i];
-        //     eprintln!("{}: Adding details to: {}", i, exploit.name);
-        //     msf.add_options(&mut exploit);
-        // }
-    }
-
     // create args number of threads with an msf process of their own to run a portion of the exploits
     // using the offset of the exploits array depending on the number of threads (first argument) for
     // each process of msf
@@ -588,35 +579,60 @@ fn main() -> std::io::Result<()> {
         num_threads_per_process = args[1].parse().unwrap();
         num_process = args[2].parse().unwrap();
     }
+    let logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
+            .build();
+    let level = logger.filter();
+    let multi_progress = Arc::new(MultiProgress::new());
+    info!("Getting exploits");
+    let exploits;
+    {
+        let mut msf = MSFProcess::new();
+
+        info!("MSF started");
+        msf.clear();
+
+        exploits = msf.get_exploits();
+    }
 
     let exp_len = exploits.len();
     let exploits_per_process = exp_len / num_process;
     let exploits_per_thread = exploits_per_process / num_threads_per_process;
 
     let mut process_threads = Vec::new();
-    let mut output_exploits = Arc::new(Mutex::new(Vec::new()));
+    let output_exploits = Arc::new(Mutex::new(Vec::new()));
     let running_process = Arc::new(Mutex::new(Vec::from([9999usize])));
 
-    let multi_progress = Arc::new(MultiProgress::new());
-    let process_bar = Arc::new(multi_progress.add(ProgressBar::new(num_process as u64)));
+    let process_bar = Arc::new(multi_progress.add(ProgressBar::new((num_process + 1) as u64)));
 
     process_bar.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{wide_bar:.cyan/blue}] {pos}/{len} Processes")
             .unwrap(),
     );
+    LogWrapper::new((*multi_progress).clone(), logger)
+        .try_init()
+        .unwrap();
+    log::set_max_level(level);
 
+    process_bar.inc(1);
     for proc in 0..num_process {
         let process_start = proc * exploits_per_process;
         let process_end = (proc + 1) * exploits_per_process;
-        eprintln!("Process {} - {} to {}", proc, process_start, process_end);
+        info!("Process {} - {} to {}", proc, process_start, process_end);
         let output_exploits_outer = Arc::clone(&output_exploits);
         let running_proc = Arc::clone(&running_process);
 
-        let thread_bar = multi_progress.add(ProgressBar::new(exploits_per_thread as u64));
+        let thread_bar;
+        if proc == num_process - 1 {
+            let num = exp_len - process_start;
+            thread_bar = multi_progress.add(ProgressBar::new(num as u64))
+        } else {
+            thread_bar = multi_progress.add(ProgressBar::new(exploits_per_thread as u64))
+        }
         thread_bar.set_style(
             ProgressStyle::default_bar()
-                .template("Process Thread {pos}/{len}: {spinner:.green} [{wide_bar:.magenta/blue}]")
+                .template("Process {process_num}, Thread {thread_num} {pos}/{len}: {spinner:.green} [{wide_bar:.magenta/blue}]")
                 .unwrap(),
         );
         let process_bar = Arc::clone(&process_bar);
@@ -639,20 +655,26 @@ fn main() -> std::io::Result<()> {
                     if (thr_idx == num_threads_per_process - 1) && ((proc + 1) == num_process) {
                         thread_end = exp_len;
                     }
-                    eprintln!("Thread {} - {} to {}", thr_idx, thread_start, thread_end);
+                    info!("Thread {} - {} to {}", thr_idx, thread_start, thread_end);
+
+                    let msg = format!("Process {} -> Thread {}", proc, thr_idx);
+                    info!("{}", msg);
+                    thread_bar_clone.set_prefix(msg);
+
                     let mut msf = msf_clone.lock().unwrap();
                     let mut exploits = msf.get_exploits();
                     for i in thread_start..thread_end {
                         let mut exploit = &mut exploits[i];
                         let res = msf.add_options(&mut exploit, Some(5));
                         if res.is_err() {
-                            // eprintln!(
-                            //     "{} {} proc {}: adding options to exploit: {}",
-                            //     "Error thread".red(),
-                            //     thr_idx,
-                            //     proc,
-                            //     exploit.name
-                            // );
+                            error!(
+                                "{} {} proc {}: adding options to exploit: {}",
+                                "Error thread".red(),
+                                thr_idx,
+                                proc,
+                                exploit.name
+                            );
+                            error!("{}", res.unwrap_err());
                             continue;
                         }
                         thread_bar_clone.inc(1);
@@ -664,7 +686,7 @@ fn main() -> std::io::Result<()> {
             }
             // eprintln!("{} {} waiting for threads", "Process".green(), proc);
             for thread in threads {
-                thread.join();
+                let _ = thread.join().unwrap();
             }
             // eprintln!("{} {} done waiting for threads", "Process".green(), proc);
             thread_bar.finish_with_message(format!("Process {} Complete", proc));
@@ -684,14 +706,14 @@ fn main() -> std::io::Result<()> {
     let process_count = process_threads.len();
     // eprintln!("Started and now waiting for {} processes", process_count);
     for process in process_threads {
-        process.join();
+        let _ = process.join().unwrap();
         // eprintln!("Process joined");
     }
     eprintln!("Done waiting for {} processes", process_count);
     process_bar.finish_with_message("All processes completed!");
 
     eprintln!("Done adding options");
-    let mut exploits = output_exploits.lock().unwrap().clone();
+    let exploits = output_exploits.lock().unwrap().clone();
     eprintln!("Exploits: {}", exploits.len());
 
     eprintln!("Writing to exploits.json");
