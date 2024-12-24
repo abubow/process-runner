@@ -1,11 +1,12 @@
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
-use log::{debug, error, info, warn, Level};
+use log::{debug, error, info, warn};
+use num_cpus;
 use std::collections::VecDeque;
-use std::f32::consts::E;
 use std::io::{BufRead, BufReader, Write};
 use std::process::Stdio;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 use std::{env, thread};
 
 use colored::Colorize;
@@ -193,7 +194,7 @@ impl MSFProcess {
         // info!("Running command: {}", command);
         self.process.clear();
         let _ = self.process.write(command);
-        thread::sleep(std::time::Duration::from_millis(1));
+        thread::sleep(std::time::Duration::from_millis(10));
         let _ = self.process.write("ping");
         let mut read_line;
         let mut read_line_err = "".to_string();
@@ -307,13 +308,17 @@ impl MSFProcess {
         let exploit_search_end_str = "\n\n\n\n";
         let exploit_end_idx = input.find(exploit_search_end_str);
         if exploit_end_idx.is_none() {
-            let msg = format!(
-                "{}:No exploit target endfound.\nInput:{:#?}",
-                "Error".red(),
-                input
-            );
-            warn!("{}", msg);
-            return Err(msg);
+            let exploit_search_end_str = "\n\n\n";
+            let exploit_end_idx = input.find(exploit_search_end_str);
+            if exploit_end_idx.is_none() {
+                let msg = format!(
+                    "{}:No exploit target end found.\nInput:{:#?}",
+                    "Error".red(),
+                    input
+                );
+                warn!("{}", msg);
+                return Err(msg);
+            }
         }
         let exploit_end_idx = exploit_end_idx.unwrap();
         let payload_idx_res = input.find(payload_search_str);
@@ -383,7 +388,7 @@ impl MSFProcess {
         let sep = " -----------\n";
         let mut module_options_start = module_option_sub.find(sep);
         if module_options_start.is_none() {
-            let sep = " ----------- \n";
+            let sep = " ----------- ";
             module_options_start = module_option_sub.find(sep);
             if module_options_start.is_none() {
                 let msg = format!(
@@ -501,7 +506,7 @@ impl MSFProcess {
         let module_options = MSFProcess::parse_option(module_options_vec);
         if module_options.is_none() {
             return Err(format!(
-                "{}:No module options found.\nmodule_option_sub:{:#?}",
+                "{}:No options found.\nmodule_option_sub:{:#?}",
                 "Error".red(),
                 module_option_sub
             ));
@@ -574,7 +579,8 @@ fn main() -> std::io::Result<()> {
     // each process of msf
     let args = env::args().collect::<Vec<String>>();
     let mut num_threads_per_process = 1;
-    let mut num_process = 8;
+    // get number of processor as process count
+    let mut num_process = num_cpus::get() / 2;
     if args.len() > 2 {
         num_threads_per_process = args[1].parse().unwrap();
         num_process = args[2].parse().unwrap();
@@ -615,6 +621,7 @@ fn main() -> std::io::Result<()> {
         .unwrap();
     log::set_max_level(level);
 
+    let start = Instant::now();
     process_bar.inc(1);
     for proc in 0..num_process {
         let process_start = proc * exploits_per_process;
@@ -632,7 +639,9 @@ fn main() -> std::io::Result<()> {
         }
         thread_bar.set_style(
             ProgressStyle::default_bar()
-                .template("Process {process_num}, Thread {thread_num} {pos}/{len}: {spinner:.green} [{wide_bar:.magenta/blue}]")
+                .template(
+                    "{prefix} {spinner:.green} [{wide_bar:.magenta/blue}] {pos}/{len} Exploits",
+                )
                 .unwrap(),
         );
         let process_bar = Arc::clone(&process_bar);
@@ -657,9 +666,8 @@ fn main() -> std::io::Result<()> {
                     }
                     info!("Thread {} - {} to {}", thr_idx, thread_start, thread_end);
 
-                    let msg = format!("Process {} -> Thread {}", proc, thr_idx);
-                    info!("{}", msg);
-                    thread_bar_clone.set_prefix(msg);
+                    let prefix = format!("Process {}, Thread {}", proc, thr_idx);
+                    thread_bar_clone.set_prefix(prefix);
 
                     let mut msf = msf_clone.lock().unwrap();
                     let mut exploits = msf.get_exploits();
@@ -709,22 +717,31 @@ fn main() -> std::io::Result<()> {
         let _ = process.join().unwrap();
         // eprintln!("Process joined");
     }
+
     eprintln!("Done waiting for {} processes", process_count);
     process_bar.finish_with_message("All processes completed!");
+
+    let end = Instant::now();
+    let duration = end - start;
+    eprintln!("Done Getting Options in {} seconds", duration.as_secs());
 
     eprintln!("Done adding options");
     let exploits = output_exploits.lock().unwrap().clone();
     eprintln!("Exploits: {}", exploits.len());
 
     eprintln!("Writing to exploits.json");
+    let start = Instant::now();
     // write to file
     let file = std::fs::File::create("exploits.json").unwrap();
     serde_json::to_writer_pretty(file, &exploits).unwrap();
     eprintln!("Done writing to exploits.json");
 
-    eprintln!("MSF dropped");
-    // timeout for 10 seconds
-    // thread::sleep(std::time::Duration::from_secs(10));
+    let end = Instant::now();
+    let duration = end - start;
+    eprintln!("Done writing to file in {} seconds", duration.as_secs());
+
+    eprintln!("Exploits options added successfully!");
+    thread::sleep(std::time::Duration::from_secs(1));
 
     Ok(())
 }
