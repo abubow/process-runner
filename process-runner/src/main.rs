@@ -5,6 +5,7 @@ use num_cpus;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use std::{env, thread};
@@ -152,8 +153,8 @@ impl Drop for Process {
 struct Exploit {
     name: String,
     payload: String,
-    options: Vec<Vec<String>>,
-    target: Vec<String>,
+    options: Option<Vec<Vec<String>>>,
+    target: Option<Vec<String>>,
 }
 struct MSFProcess {
     process: Process,
@@ -241,8 +242,8 @@ impl MSFProcess {
             .into_iter()
             .map(|name| Exploit {
                 name,
-                options: Vec::new(),
-                target: Vec::new(),
+                options: None,
+                target: None,
                 payload: "".to_string(),
             })
             .collect();
@@ -256,38 +257,21 @@ impl MSFProcess {
         let mut res = Vec::new();
         let mut input = VecDeque::from(input);
         loop {
-            // eprintln!("Len: {}", input.len());
-            let last;
-            if input.len() == 3 {
-                last = "|-line-|";
-            } else if input.len() < 4 {
-                // eprintln!(
-                //     "{} {:#?}",
-                //     "Error in parse_options: Out of bounds Access in".red(),
-                //     input
-                // );
-                return None;
-            } else {
-                last = &input[3];
-            }
             let mut options = Vec::new();
-            // eprintln!("first: {}", input[0]);
-            if last.to_string() == "|-line-|" {
-                options.push(VecDeque::pop_front(&mut input).unwrap());
-                options.push("".to_string());
-                options.push(VecDeque::pop_front(&mut input).unwrap());
-                options.push(VecDeque::pop_front(&mut input).unwrap());
-                if input.len() != 0 && input[0] == "|-line-|" {
-                    VecDeque::pop_front(&mut input).unwrap();
+            for i in 0..4 {
+                let popped = VecDeque::pop_front(&mut input).unwrap();
+                if popped=="|-line-|" && i == 3{
+                    options.insert(1, "".to_string());
                 }
-            } else {
-                for _ in 0..4 {
-                    options.push(VecDeque::pop_front(&mut input).unwrap());
-                }
-                if input.len() != 0 && input[0] == "|-line-|" {
-                    VecDeque::pop_front(&mut input).unwrap();
+                options.push(popped);
+                if input.len() == 0 {
+                    break;
                 }
             }
+            if input.len() != 0 && input[0] == "|-line-|" {
+                VecDeque::pop_front(&mut input).unwrap();
+            }
+
             res.push(options);
             if input.len() == 0 {
                 break;
@@ -298,7 +282,7 @@ impl MSFProcess {
 
     fn extract_options_and_payloads(
         input: &str,
-    ) -> Result<(String, Vec<Vec<String>>, Vec<String>), String> {
+    ) -> Result<(String, Option<Vec<Vec<String>>>, Vec<String>), String> {
         // eprintln!("Extracting from: {:#?}", input);
         let payload_str;
         let module_option_sub;
@@ -386,6 +370,7 @@ impl MSFProcess {
         }
 
         let sep = " -----------\n";
+        let mut non_module_options_expliot = false;
         let mut module_options_start = module_option_sub.find(sep);
         if module_options_start.is_none() {
             let sep = " ----------- ";
@@ -396,12 +381,9 @@ impl MSFProcess {
                     "Error".red(),
                     module_option_sub
                 );
-                warn!("{}", msg);
-                return Err(msg);
+                non_module_options_expliot = true;
             }
         }
-        let module_options_start = module_options_start.unwrap();
-        let module_options_unparsed = &module_option_sub[module_options_start + sep.len()..];
         let sep = " ----\n";
         let mut exploits_start = exploit_targets_sub.find(sep);
         if exploits_start.is_none() {
@@ -420,98 +402,107 @@ impl MSFProcess {
         let exploits_start = exploits_start.unwrap();
         let exploit_target_unparsed = &exploit_targets_sub[exploits_start + sep.len()..];
 
-        let mod_lines: Vec<String> = module_options_unparsed
-            .split("\n")
-            .map(|w| w.replace(". ", "."))
-            .filter(|w| w.to_string() != "")
-            .collect();
-        let newline = mod_lines.join("  |-line-|  ");
-        let mut module_options_vec: Vec<String> =
-            newline.split("  ").map(|w| w.trim().to_string()).collect();
+        let module_options;
+        if !non_module_options_expliot {
+            let module_options_start = module_options_start.unwrap();
+            let module_options_unparsed = &module_option_sub[module_options_start + sep.len()..];
+            let mod_lines: Vec<String> = module_options_unparsed
+                .split("\n")
+                .map(|w| w.replace(". ", "."))
+                .filter(|w| w.to_string() != "")
+                .collect();
+            let newline = mod_lines.join("  |-line-|  ");
+            let mut module_options_vec: Vec<String> =
+                newline.split("  ").map(|w| w.trim().to_string()).collect();
 
-        // fixing for multi line sections
-        let mut line_section_count = 0;
-        let mut section_indexes = [0, 0, 0, 0];
-        let mut previous_section_indexes = [0, 0, 0, 0];
-        let mut last_line_index = 0;
-        let mut sections_to_remove = Vec::new();
-        for i in 0..module_options_vec.len() {
-            if module_options_vec[i] == "|-line-|" {
-                if line_section_count == 1 || line_section_count == 2 {
-                    // Has only second section
-                    if module_options_vec[i - 1] == "" {
-                        // Add to 2nd section
-                        let previous_string = module_options_vec[previous_section_indexes[1]]
-                            .to_string()
-                            .clone();
-                        let current_string = module_options_vec[section_indexes[0]].clone();
-                        let combined_string = previous_string + &current_string;
-                        module_options_vec[previous_section_indexes[1]] = combined_string;
-                    }
-                    // Has both sections
-                    else if section_indexes[1] != 0 {
-                        // Add to 2nd section
-                        let previous_string = module_options_vec[previous_section_indexes[1]]
-                            .to_string()
-                            .clone();
-                        let current_string = module_options_vec[section_indexes[0]].clone();
-                        let combined_string = previous_string + &current_string;
-                        module_options_vec[previous_section_indexes[1]] = combined_string;
+            // fixing for multi line sections
+            let mut line_section_count = 0;
+            let mut section_indexes = [0, 0, 0, 0];
+            let mut previous_section_indexes = [0, 0, 0, 0];
+            let mut last_line_index = 0;
+            let mut sections_to_remove = Vec::new();
+            for i in 0..module_options_vec.len() {
+                if module_options_vec[i] == "|-line-|" {
+                    if line_section_count == 1 || line_section_count == 2 {
+                        // Has only second section
+                        if module_options_vec[i - 1] == "" {
+                            // Add to 2nd section
+                            let previous_string = module_options_vec[previous_section_indexes[1]]
+                                .to_string()
+                                .clone();
+                            let current_string = module_options_vec[section_indexes[0]].clone();
+                            let combined_string = previous_string + &current_string;
+                            module_options_vec[previous_section_indexes[1]] = combined_string;
+                        }
+                        // Has both sections
+                        else if section_indexes[1] != 0 {
+                            // Add to 2nd section
+                            let previous_string = module_options_vec[previous_section_indexes[1]]
+                                .to_string()
+                                .clone();
+                            let current_string = module_options_vec[section_indexes[0]].clone();
+                            let combined_string = previous_string + &current_string;
+                            module_options_vec[previous_section_indexes[1]] = combined_string;
 
-                        // Add to 4th section
-                        let previous_string = module_options_vec[previous_section_indexes[3]]
-                            .to_string()
-                            .clone();
-                        let current_string = module_options_vec[section_indexes[1]].clone();
-                        let combined_string = previous_string + &current_string;
-                        module_options_vec[previous_section_indexes[3]] = combined_string;
+                            // Add to 4th section
+                            let previous_string = module_options_vec[previous_section_indexes[3]]
+                                .to_string()
+                                .clone();
+                            let current_string = module_options_vec[section_indexes[1]].clone();
+                            let combined_string = previous_string + &current_string;
+                            module_options_vec[previous_section_indexes[3]] = combined_string;
+                        }
+                        // Has only 4th section
+                        else {
+                            // Add to 4th section
+                            let previous_string = module_options_vec[previous_section_indexes[3]]
+                                .to_string()
+                                .clone();
+                            let current_string = module_options_vec[section_indexes[0]].clone();
+                            let combined_string = previous_string + &current_string;
+                            module_options_vec[previous_section_indexes[3]] = combined_string;
+                        }
+                        sections_to_remove.push((last_line_index, i));
+                        last_line_index = i;
+                    } else {
+                        previous_section_indexes = section_indexes;
                     }
-                    // Has only 4th section
-                    else {
-                        // Add to 4th section
-                        let previous_string = module_options_vec[previous_section_indexes[3]]
-                            .to_string()
-                            .clone();
-                        let current_string = module_options_vec[section_indexes[0]].clone();
-                        let combined_string = previous_string + &current_string;
-                        module_options_vec[previous_section_indexes[3]] = combined_string;
-                    }
-                    sections_to_remove.push((last_line_index, i));
-                    last_line_index = i;
-                } else {
-                    previous_section_indexes = section_indexes;
+                    line_section_count = 0;
+                    section_indexes = [0, 0, 0, 0];
+                } else if module_options_vec[i] != "" {
+                    section_indexes[line_section_count] = i;
+                    line_section_count += 1;
                 }
-                line_section_count = 0;
-                section_indexes = [0, 0, 0, 0];
-            } else if module_options_vec[i] != "" {
-                section_indexes[line_section_count] = i;
-                line_section_count += 1;
             }
-        }
 
-        // remove sections
-        let mut offseted_size: i32 = 0;
-        for i in sections_to_remove {
-            let start_index = (i.0 as i32 + offseted_size) as usize;
-            let end_index = (i.1 as i32 + offseted_size) as usize;
-            module_options_vec.drain(start_index..end_index + 1);
-            offseted_size -= i.1 as i32 - i.0 as i32;
-        }
+            // remove sections
+            let mut offseted_size: i32 = 0;
+            for i in sections_to_remove {
+                let start_index = (i.0 as i32 + offseted_size) as usize;
+                let end_index = (i.1 as i32 + offseted_size) as usize;
+                module_options_vec.drain(start_index..end_index + 1);
+                offseted_size -= i.1 as i32 - i.0 as i32;
+            }
 
-        let module_options_vec: Vec<String> = module_options_vec
-            .iter()
-            .map(|w| w.to_string())
-            .filter(|w| w != "")
-            .collect();
-        let module_options = MSFProcess::parse_option(module_options_vec);
-        if module_options.is_none() {
-            return Err(format!(
-                "{}:No options found.\nmodule_option_sub:{:#?}",
-                "Error".red(),
-                module_option_sub
-            ));
+            let module_options_vec: Vec<String> = module_options_vec
+                .iter()
+                .map(|w| w.to_string())
+                .filter(|w| w != "")
+                .collect();
+            let module_options_o = MSFProcess::parse_option(module_options_vec.clone());
+            if module_options_o.is_none() {
+                return Err(format!(
+                    "{}:No options found.\n\nmodule_option_sub:{:#?}\n\nmodule_options_vec:{:#?}\n\nmodule_options_o:{:#?}",
+                    "Error".red(),
+                    module_option_sub,
+                    module_options_vec,
+                    module_options_o
+                ));
+            }
+            module_options = module_options_o;
+        } else {
+            module_options = None;
         }
-        let module_options = module_options.unwrap();
 
         let exploit_target: Vec<String> = exploit_target_unparsed
             .split("  ")
@@ -554,7 +545,7 @@ impl MSFProcess {
             let options = options.unwrap();
             exploit.payload = options.0;
             exploit.options = options.1;
-            exploit.target = options.2;
+            exploit.target = Some(options.2);
             break;
         }
 
@@ -586,7 +577,7 @@ fn main() -> std::io::Result<()> {
         num_process = args[2].parse().unwrap();
     }
     let logger =
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .build();
     let level = logger.filter();
     let multi_progress = Arc::new(MultiProgress::new());
@@ -718,29 +709,65 @@ fn main() -> std::io::Result<()> {
         // eprintln!("Process joined");
     }
 
-    eprintln!("Done waiting for {} processes", process_count);
+    info!("Done waiting for {} processes", process_count);
     process_bar.finish_with_message("All processes completed!");
 
     let end = Instant::now();
     let duration = end - start;
-    eprintln!("Done Getting Options in {} seconds", duration.as_secs());
+    info!("Done Getting Options in {} seconds", duration.as_secs());
 
-    eprintln!("Done adding options");
+    info!("Done adding options");
     let exploits = output_exploits.lock().unwrap().clone();
-    eprintln!("Exploits: {}", exploits.len());
+    let exp_len = exploits.len() as u64;
+    info!("Exploits: {}", exp_len);
 
-    eprintln!("Writing to exploits.json");
+    // create new bar to write concurrently to the file while showing progress
+    let process_bar = Arc::new(multi_progress.add(ProgressBar::new(exp_len)));
+    process_bar.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{wide_bar:.cyan/blue}] {pos}/{len} Exploits")
+            .unwrap(),
+    );
+
+    info!("Writing to exploits.json");
     let start = Instant::now();
-    // write to file
-    let file = std::fs::File::create("exploits.json").unwrap();
-    serde_json::to_writer_pretty(file, &exploits).unwrap();
-    eprintln!("Done writing to exploits.json");
+
+    let write_thread = thread::spawn(move || {
+        // write to file
+        let file = std::fs::File::create("exploits.json").unwrap();
+        serde_json::to_writer_pretty(file, &exploits).unwrap();
+        info!("Done writing to exploits.json");
+    });
+
+    let speed = Arc::new(AtomicUsize::new(10));
+    let exp_len_arc = Arc::new(exp_len);
+    let speed_clone = Arc::clone(&speed);
+    let exp_len_clone = Arc::clone(&exp_len_arc);
+    let process_bar = Arc::clone(&process_bar);
+    let process_bar_clone = Arc::clone(&process_bar);
+    
+    let progress_thread = thread::spawn(move || loop {
+        let speed = speed_clone.load(Ordering::Relaxed);
+        let speed = format!("{} Exploits/s", speed);
+        process_bar_clone.set_prefix(speed);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        process_bar_clone.inc(1);
+        speed_clone.fetch_add(1, Ordering::Relaxed);
+        if process_bar_clone.length().unwrap() == *exp_len_clone {
+            break;
+        }
+    });
+
+    let _ = progress_thread.join().unwrap();
+    let _ = write_thread.join().unwrap();
+
+    process_bar.finish_with_message("Done writing to file!");
 
     let end = Instant::now();
     let duration = end - start;
-    eprintln!("Done writing to file in {} seconds", duration.as_secs());
+    info!("Done writing to file in {} seconds", duration.as_secs());
 
-    eprintln!("Exploits options added successfully!");
+    info!("Exploits options added successfully!");
     thread::sleep(std::time::Duration::from_secs(1));
 
     Ok(())
