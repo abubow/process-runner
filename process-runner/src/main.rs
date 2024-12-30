@@ -2,10 +2,9 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
 use log::{debug, error, info, warn};
 use num_cpus;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use std::{env, thread};
@@ -149,11 +148,42 @@ impl Drop for Process {
     }
 }
 
+#[derive(Serialize, Clone, Debug)]
+struct Parameter {
+    name: String,
+    default_value: Option<String>,
+    required: bool,
+    description: String,
+}
+impl Parameter {
+    pub fn new(
+        name: String,
+        default_value: Option<String>,
+        required: bool,
+        description: String,
+    ) -> Self {
+        Self {
+            name,
+            default_value,
+            required,
+            description,
+        }
+    }
+}
+
+#[derive(Serialize, Clone)]
+struct ExploitDetails {
+    name: String,
+    disclosureDate: String,
+    rank: String,
+    check: bool,
+    description: String,
+}
 #[derive(Serialize, Clone)]
 struct Exploit {
     name: String,
     payload: String,
-    options: Option<Vec<Vec<String>>>,
+    options: Option<Vec<Parameter>>,
     target: Option<Vec<String>>,
 }
 struct MSFProcess {
@@ -252,40 +282,123 @@ impl MSFProcess {
         exploits
     }
 
-    fn parse_option(input: Vec<String>) -> Option<Vec<Vec<String>>> {
-        // eprintln!("Parsing: {:#?}", input);
-        let mut res = Vec::new();
-        let mut input = VecDeque::from(input);
-        loop {
-            let mut options = Vec::new();
-            for i in 0..4 {
-                let popped = VecDeque::pop_front(&mut input).unwrap();
-                if popped=="|-line-|" && i == 3{
-                    options.insert(1, "".to_string());
-                }
-                options.push(popped);
-                if input.len() == 0 {
-                    break;
-                }
-            }
-            if input.len() != 0 && input[0] == "|-line-|" {
-                VecDeque::pop_front(&mut input).unwrap();
-            }
-
-            res.push(options);
-            if input.len() == 0 {
-                break;
+    fn extract_exploit_details(input: &str) -> Vec<ExploitDetails> {
+        let sep = " -----------\n";
+        let mut start_index_opt = input.find(sep);
+        if start_index_opt.is_none() {
+            let sep = " ----------- ";
+            start_index_opt = input.find(sep);
+            println!("No exploit details found.{:#?}", input);
+            if start_index_opt.is_none() {
+                return Vec::new();
             }
         }
+        let start_index = start_index_opt.unwrap();
+        let truncated_input = &input[start_index + sep.len()..];
+        let sections = truncated_input
+            .split("\n")
+            .map(|line| {
+                line.split("  ")
+                    .map(|w| w.trim().to_string())
+                    .filter(|w| w != "")
+                    .collect::<Vec<String>>()
+            })
+            .filter(|w| w.len() > 0)
+            .collect::<Vec<Vec<String>>>();
+
+        let mut details: Vec<ExploitDetails> = Vec::new();
+        for exploit in sections {
+            if exploit.len() < 5 {
+                let last_index = details.len() - 1;
+                println!("i: {}", last_index);
+                details[last_index].description.push_str(&exploit[0]);
+                continue;
+            }
+            details.push(ExploitDetails {
+                name: exploit[1].clone(),
+                disclosureDate: exploit[2].clone(),
+                rank: exploit[3].clone(),
+                check: exploit[4] == "Yes",
+                description: exploit[5].clone(),
+            });
+        }
+        details
+    }
+    pub fn get_exploits_details(&mut self) -> Vec<ExploitDetails> {
+        self.run_command("show exploits");
+        let lines_vec = self.output.clone();
+        let line = lines_vec.join("\n");
+
+        MSFProcess::extract_exploit_details(&line)
+    }
+    pub fn get_auxiliary_details(&mut self) -> Vec<ExploitDetails> {
+        self.run_command("show auxiliary");
+        let lines_vec = self.output.clone();
+        let line = lines_vec.join("\n");
+
+        MSFProcess::extract_exploit_details(&line)
+    }
+    pub fn get_payload_details(&mut self) -> Vec<ExploitDetails> {
+        self.run_command("show payloads");
+        let lines_vec = self.output.clone();
+        let line = lines_vec.join("\n");
+
+        MSFProcess::extract_exploit_details(&line)
+    }
+    fn parse_option(input: Vec<String>) -> Option<Vec<Parameter>> {
+        let mut res = Vec::new();
+        let mut input = VecDeque::from(input);
+
+        while !input.is_empty() {
+            let mut options = Vec::new();
+
+            for i in 0..4 {
+                if let Some(popped) = input.pop_front() {
+                    if popped == "|-line-|" && i == 3 {
+                        options.insert(1, "".to_string());
+                    }
+                    options.push(popped);
+                } else {
+                    // Handle case where there are not enough items left in the input
+                    options.push("".to_string()); // Or handle this case differently
+                }
+            }
+
+            if options.len() < 4 {
+                // Ensure we have at least 4 elements for `Parameter::new`
+                options.resize(4, "".to_string());
+            }
+
+            let parameter = Parameter::new(
+                options[0].clone(),
+                if options[1] != "" {
+                    Some(options[1].clone())
+                } else {
+                    None
+                },
+                options[2] == "yes",
+                options[3].clone(),
+            );
+            res.push(parameter);
+
+            // Skip any `|-line-|` at the front of `input`
+            if let Some(front) = input.front() {
+                if front == "|-line-|" {
+                    input.pop_front();
+                }
+            }
+        }
+
         Some(res)
     }
 
     fn extract_options_and_payloads(
         input: &str,
-    ) -> Result<(String, Option<Vec<Vec<String>>>, Vec<String>), String> {
+    ) -> Result<(String, Option<Vec<Parameter>>, Vec<String>), String> {
         // eprintln!("Extracting from: {:#?}", input);
         let payload_str;
         let module_option_sub;
+        let payload_option_sub;
         let exploit_targets_sub;
         let payload_search_str = "Payload options (";
         let exploit_search_str = "Exploit target:";
@@ -317,6 +430,7 @@ impl MSFProcess {
             let exp_idx = exp_idx.unwrap();
 
             payload_str = "";
+            payload_option_sub = "";
             if input.len() <= exp_idx {
                 let msg = format!("{}:Out of bounds. Looking for module options substring. \nInput len:{} idx:{}\n {:#?}", "Error".red(), input.len(), exp_idx, input);
                 warn!("{}", msg);
@@ -362,9 +476,17 @@ impl MSFProcess {
                 return Err(msg);
             }
 
+            // module options come first from start till payload name
+            module_option_sub = &input[..payload_idx];
+
+            // then payload name until "):"
             payload_str =
                 &input[payload_idx + payload_search_str.len()..payload_idx + payload_end_idx];
-            module_option_sub = &input[..payload_idx];
+
+            // then payload options string till exploi target start
+            payload_option_sub = &input[payload_idx + payload_end_idx..payload_idx + exp_idx];
+
+            // then exploit targets
             exploit_targets_sub =
                 &input[payload_idx + exp_idx + exploit_search_str.len()..exploit_end_idx];
         }
@@ -376,13 +498,28 @@ impl MSFProcess {
             let sep = " ----------- ";
             module_options_start = module_option_sub.find(sep);
             if module_options_start.is_none() {
-                let msg = format!(
-                    "{}:No module options found.\nmodule_option_sub:{:#?}",
-                    "Error".red(),
-                    module_option_sub
-                );
                 non_module_options_expliot = true;
             }
+        }
+        let non_payload_options_exploit = payload_option_sub.is_empty();
+        let mut payload_options_start = payload_option_sub.find(sep);
+        if !non_payload_options_exploit {
+            if payload_options_start.is_none() {
+                let sep = " ----------- ";
+                payload_options_start = payload_option_sub.find(sep);
+                if module_options_start.is_none() {
+                    let msg = format!(
+                        "{}:No payload options found.\nmodule_option_sub:{:#?}\npayload_option_sub:{:#?}",
+                        "Error".red(),
+                        module_option_sub,
+                        payload_option_sub
+                    );
+                    warn!("{}", msg);
+                    return Err(msg);
+                }
+            }
+            let payload_options_start = payload_options_start.unwrap();
+            let payload_options_unparsed = &payload_option_sub[payload_options_start + sep.len()..];
         }
         let sep = " ----\n";
         let mut exploits_start = exploit_targets_sub.find(sep);
@@ -577,22 +714,39 @@ fn main() -> std::io::Result<()> {
         num_process = args[2].parse().unwrap();
     }
     let logger =
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-            .build();
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).build();
     let level = logger.filter();
     let multi_progress = Arc::new(MultiProgress::new());
-    info!("Getting exploits");
     let exploits;
+    let payloads;
+    let auxiliary;
     {
         let mut msf = MSFProcess::new();
-
-        info!("MSF started");
+        info!("Getting exploits");
         msf.clear();
-
-        exploits = msf.get_exploits();
+        exploits = msf.get_exploits_details();
+        payloads = msf.get_payload_details();
+        auxiliary = msf.get_auxiliary_details();
     }
 
     let exp_len = exploits.len();
+    info!("Writing {} exploits to exploits.json", exp_len);
+    let file = std::fs::File::create("exploits.json").unwrap();
+    serde_json::to_writer_pretty(file, &exploits).unwrap();
+    info!("Done writing to exploits.json");
+
+    let payload_len = payloads.len();
+    info!("Writing {} payloads to payloads.json", payload_len);
+    let file = std::fs::File::create("payloads.json").unwrap();
+    serde_json::to_writer_pretty(file, &payloads).unwrap();
+    info!("Done writing to payloads.json");
+
+    let auxiliary_len = auxiliary.len();
+    info!("Writing {} auxiliary to auxiliaries.json", auxiliary_len);
+    let file = std::fs::File::create("auxiliaries.json").unwrap();
+    serde_json::to_writer_pretty(file, &auxiliary).unwrap();
+    info!("Done writing to auxiliaries.json");
+
     let exploits_per_process = exp_len / num_process;
     let exploits_per_thread = exploits_per_process / num_threads_per_process;
 
@@ -683,11 +837,9 @@ fn main() -> std::io::Result<()> {
                 });
                 threads.push(thread);
             }
-            // eprintln!("{} {} waiting for threads", "Process".green(), proc);
             for thread in threads {
                 let _ = thread.join().unwrap();
             }
-            // eprintln!("{} {} done waiting for threads", "Process".green(), proc);
             thread_bar.finish_with_message(format!("Process {} Complete", proc));
             process_bar.inc(1);
             {
@@ -729,32 +881,54 @@ fn main() -> std::io::Result<()> {
             .unwrap(),
     );
 
-    info!("Writing to exploits.json");
+    info!("Writing to exploits_options.json");
     let start = Instant::now();
+
+    let exploits_map: HashMap<String, HashMap<String, serde_json::Value>> = exploits
+        .into_iter()
+        .map(|exploit| {
+            let mut exploit_data = HashMap::new();
+            exploit_data.insert(
+                "payload".to_string(),
+                serde_json::to_value(&exploit.payload).unwrap(),
+            );
+            exploit_data.insert(
+                "options".to_string(),
+                serde_json::to_value(&exploit.options).unwrap(),
+            );
+            exploit_data.insert(
+                "target".to_string(),
+                serde_json::to_value(&exploit.target).unwrap(),
+            );
+            (exploit.name, exploit_data)
+        })
+        .collect();
 
     let write_thread = thread::spawn(move || {
         // write to file
-        let file = std::fs::File::create("exploits.json").unwrap();
-        serde_json::to_writer_pretty(file, &exploits).unwrap();
-        info!("Done writing to exploits.json");
+        let file = std::fs::File::create("exploits_options.json").unwrap();
+        serde_json::to_writer_pretty(file, &exploits_map).unwrap();
+        info!("Done writing to exploits_options.json");
     });
 
-    let speed = Arc::new(AtomicUsize::new(10));
     let exp_len_arc = Arc::new(exp_len);
-    let speed_clone = Arc::clone(&speed);
     let exp_len_clone = Arc::clone(&exp_len_arc);
     let process_bar = Arc::clone(&process_bar);
     let process_bar_clone = Arc::clone(&process_bar);
-    
-    let progress_thread = thread::spawn(move || loop {
-        let speed = speed_clone.load(Ordering::Relaxed);
-        let speed = format!("{} Exploits/s", speed);
-        process_bar_clone.set_prefix(speed);
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        process_bar_clone.inc(1);
-        speed_clone.fetch_add(1, Ordering::Relaxed);
-        if process_bar_clone.length().unwrap() == *exp_len_clone {
-            break;
+
+    let progress_thread = thread::spawn(move || {
+        let mut speed = 1;
+        let mut progress = 0;
+        let total = *exp_len_clone;
+        while progress < total {
+            std::thread::sleep(std::time::Duration::from_millis(speed));
+            process_bar_clone.inc(1);
+            progress += 1;
+            // Increase speed more aggressively as progress approaches total.
+            // The 50 and 2 adjust the curve of the slowdown.  Experiment with these.
+            if speed < 1000 {
+                speed = (speed as f64 + (2.0 * (progress as f64 / total as f64).powf(1.10))) as u64;
+            }
         }
     });
 
