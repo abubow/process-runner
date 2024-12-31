@@ -354,7 +354,7 @@ impl MSFProcess {
 
             for i in 0..4 {
                 if let Some(popped) = input.pop_front() {
-                    if popped == "|-line-|" && i == 3 {
+                    if popped == "|-line-|" && i == 2 {
                         options.insert(1, "".to_string());
                     }
                     options.push(popped);
