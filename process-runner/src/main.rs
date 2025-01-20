@@ -174,7 +174,7 @@ impl Parameter {
 #[derive(Serialize, Clone)]
 struct ExploitDetails {
     name: String,
-    disclosureDate: String,
+    disclosure_date: String,
     rank: String,
     check: bool,
     description: String,
@@ -183,6 +183,7 @@ struct ExploitDetails {
 struct Exploit {
     name: String,
     payload: String,
+    payload_options: Option<Vec<Parameter>>,
     options: Option<Vec<Parameter>>,
     target: Option<Vec<String>>,
 }
@@ -274,6 +275,7 @@ impl MSFProcess {
                 name,
                 options: None,
                 target: None,
+                payload_options: None,
                 payload: "".to_string(),
             })
             .collect();
@@ -316,7 +318,7 @@ impl MSFProcess {
             }
             details.push(ExploitDetails {
                 name: exploit[1].clone(),
-                disclosureDate: exploit[2].clone(),
+                disclosure_date: exploit[2].clone(),
                 rank: exploit[3].clone(),
                 check: exploit[4] == "Yes",
                 description: exploit[5].clone(),
@@ -650,6 +652,65 @@ impl MSFProcess {
         Ok((payload_str.to_string(), module_options, exploit_target))
     }
 
+    fn get_sections(input: Vec<String>) -> Vec<Vec<String>> {
+        let mut sections = vec![];
+        let mut current_section = Vec::new();
+        let mut section_open = false;
+
+        let mut lines = vec![];
+        let mut previous_line: Option<String> = None;
+        for i in 0..input.len() {
+            let line = &input[i];
+            let sublines: Vec<String> = line
+                .split("\n")
+                .map(|x| {
+                    let sp: Vec<String> = x
+                        .split("  ")
+                        .filter(|y| y.to_string() != "")
+                        .map(|x| x.to_string())
+                        .collect();
+                    if sp.len() == 1 {}
+                    sp.join("<--->").to_string()
+                })
+                .collect();
+            lines.extend(sublines);
+        }
+        println!("lines: {}", lines.join("\n"));
+        let mut empty_count = 0;
+        for i in 0..lines.len() {
+            let line = &lines[i];
+            if section_open {
+                if line == "" {
+                    empty_count += 1;
+                    continue;
+                }
+                if empty_count == 2 {
+                    sections.push(current_section.clone());
+                    section_open = false;
+                    current_section.clear();
+                    empty_count = 0;
+                    continue;
+                }
+                current_section.push(line.to_string());
+                empty_count = 0;
+            } else {
+                if line.contains("----") {
+                    section_open = true;
+                    current_section = Vec::new();
+                    let section_title = &lines[i - 3];
+                    current_section.push(section_title.to_string());
+                }
+                continue;
+            }
+        }
+        if section_open {
+            // remove last two elements
+            current_section.pop();
+            current_section.pop();
+            sections.push(current_section.clone());
+        }
+        sections
+    }
     pub fn add_options(
         &mut self,
         exploit: &mut Exploit,
@@ -669,20 +730,113 @@ impl MSFProcess {
             let show_options = "show options";
             self.run_command(&show_options);
             let output = self.output.clone();
-            let text = output.join("\n");
-            // eprintln!("vec: {:#?}\ntext:{}", output, text);
-            let options = MSFProcess::extract_options_and_payloads(text.as_str());
-            if options.is_err() {
-                try_i += 1;
-                if try_i >= retries {
-                    return Err(options.unwrap_err());
+
+            let sections = MSFProcess::get_sections(output);
+            let mut exploit_options = vec![];
+            let mut payload_options = vec![];
+            let mut target = vec![];
+            for (i, v) in sections.iter().enumerate() {
+                // info!("sections: {:#?}", v);
+                if v[0].to_lowercase().contains(&"module".to_lowercase()) {
+                    let remain = &v[1..];
+                    let mut previous_line: Option<String> = None;
+                    let mut lines: Vec<String> = vec![];
+                    for (i, subline) in remain.iter().enumerate() {
+                        if subline.split("<--->").count() <= 2 {
+                            // error!("Found single line:{}", subline);
+                            // If there's a previous line, append the current string to it.
+                            if !previous_line.is_none() {
+                                lines.pop();
+                                lines.push(previous_line.clone().unwrap() + subline);
+                            } else {
+                                // If no previous line, treat it as a standalone line.
+                                lines.push(subline.to_string());
+                            }
+                        } else {
+                            // Add the line as is when it's not a single string.
+                            lines.push(subline.to_string());
+                            previous_line = Some(subline.to_string());
+                        }
+                    }
+                    exploit_options = lines
+                        .iter()
+                        .map(|x| {
+                            x.split("<--->")
+                                .map(|x| x.to_string())
+                                .filter(|x| x != "")
+                                .collect::<Vec<String>>()
+                        })
+                        .map(|line| {
+                            if line.len() == 3 {
+                                Parameter::new(
+                                    line[0].clone(),
+                                    None,
+                                    line[1] == "yes",
+                                    line[2].clone(),
+                                )
+                            } else {
+                                if line.len() != 4 {
+                                    error!("{:#?}", line);
+                                }
+                                Parameter::new(
+                                    line[0].clone(),
+                                    Some(line[1].clone()),
+                                    line[2] == "yes",
+                                    line[3].clone(),
+                                )
+                            }
+                        })
+                        .collect::<Vec<Parameter>>();
+                } else if v[0].to_lowercase().contains(&"payload".to_lowercase()) {
+                    let payload_name = v[0].clone();
+                    exploit.payload = payload_name
+                        .replace("Payload options (", "")
+                        .replace("):", "");
+                    let remain = &v[1..];
+                    remain
+                        .iter()
+                        .map(|x| {
+                            x.split("<--->")
+                                .map(|x| x.to_string())
+                                .collect::<Vec<String>>()
+                        })
+                        .for_each(|line| {
+                            if line.len() == 3 {
+                                payload_options.push(Parameter::new(
+                                    line[0].clone(),
+                                    None,
+                                    line[1] == "yes",
+                                    line[2].clone(),
+                                ))
+                            } else if line.len() == 4 {
+                                payload_options.push(Parameter::new(
+                                    line[0].clone(),
+                                    Some(line[1].clone()),
+                                    line[2] == "yes",
+                                    line[3].clone(),
+                                ));
+                            }
+                        })
+                } else if v[0].to_lowercase().contains(&"target".to_lowercase()) {
+                    let remain = &v[1..];
+                    remain.iter().for_each(|x| {
+                        target.extend(
+                            x.split("<--->")
+                                .map(|x| x.to_string())
+                                .collect::<Vec<String>>(),
+                        )
+                    });
                 }
-                continue;
             }
-            let options = options.unwrap();
-            exploit.payload = options.0;
-            exploit.options = options.1;
-            exploit.target = Some(options.2);
+            if exploit_options.len() > 0 {
+                exploit.options = Some(exploit_options);
+            }
+            if payload_options.len() > 0 {
+                exploit.payload_options = Some(payload_options);
+            }
+            if target.len() > 0 {
+                exploit.target = Some(target);
+            }
             break;
         }
 
@@ -926,8 +1080,8 @@ fn main() -> std::io::Result<()> {
             progress += 1;
             // Increase speed more aggressively as progress approaches total.
             // The 50 and 2 adjust the curve of the slowdown.  Experiment with these.
-            if speed < 1000 {
-                speed = (speed as f64 + (2.0 * (progress as f64 / total as f64).powf(1.10))) as u64;
+            if speed < 600 {
+                speed = (speed as f64 + (1.125 * (progress as f64 / total as f64).powf(1.10))) as u64;
             }
         }
     });
